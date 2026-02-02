@@ -8,7 +8,6 @@
   },
   "dependencies": {
     "fastify": "^4.26.0",
-    "@fastify/rawbody": "^6.0.0",
     "node-fetch": "^3.3.2"
   }
 }
