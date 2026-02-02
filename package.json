@@ -1,0 +1,14 @@
+{
+  "name": "wecom-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "fastify": "^4.26.0",
+    "@fastify/raw-body": "^6.0.0",
+    "node-fetch": "^3.3.2"
+  }
+}
