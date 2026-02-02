@@ -14,4 +14,4 @@ primary_region = 'lhr'
 [[vm]]
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 512  # Remove the conflicting 'memory' line
+  memory_mb = 512  # Remove the conflicting 'memory' li
