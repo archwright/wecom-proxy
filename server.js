@@ -4,7 +4,7 @@ import { getWecomAccessToken, wecomSendText } from "./wecom.js";
 
 const app = Fastify({
   logger: true,
-  bodyLimit: 5 * 1024 * 1024
+  bodyLimit: 5 * 1024 * 1024,
 });
 
 // Register raw body parsing for XML
@@ -22,7 +22,7 @@ const {
   WECOM_SECRET,
   WECOM_AGENT_ID,
   WECOM_KF_SECRET,
-  SUPABASE_FUNCTIONS_URL
+  SUPABASE_FUNCTIONS_URL,
 } = process.env;
 
 function requireAuth(req) {
@@ -35,34 +35,49 @@ function requireAuth(req) {
   }
 }
 
+/**
+ * Health check for Fly
+ * Fly will call GET /health to decide if the machine is routable.
+ */
 app.get("/health", async () => ({ ok: true }));
 
+// ================================
 // Supabase -> Proxy -> WeCom (outbound messages)
+// ================================
 app.post("/wecom/send", async (req, reply) => {
   requireAuth(req);
   const { toUser, content } = req.body || {};
   if (!toUser || !content) {
     return reply.code(400).send({ error: "Missing toUser or content" });
   }
+
   const token = await getWecomAccessToken({
     corpId: WECOM_CORP_ID,
-    corpSecret: WECOM_SECRET
+    corpSecret: WECOM_SECRET,
   });
+
   const result = await wecomSendText({
     accessToken: token,
     agentId: WECOM_AGENT_ID,
     toUser,
-    content
+    content,
   });
+
   return { ok: true, result };
 });
 
-// WeCom -> Proxy -> Supabase (URL VERIFICATION - GET)
+// ================================
+// WeCom -> Proxy -> Supabase (Standard callback)
+// ================================
+
+// URL VERIFICATION - GET
 app.get("/wecom/callback", async (req, reply) => {
+  if (!SUPABASE_INBOUND_FORWARD_URL) {
+    throw new Error("Missing SUPABASE_INBOUND_FORWARD_URL");
+  }
+
   const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
-  const url = qs
-    ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}`
-    : SUPABASE_INBOUND_FORWARD_URL;
+  const url = qs ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}` : SUPABASE_INBOUND_FORWARD_URL;
 
   app.log.info(`[GET] Forwarding verification to: ${url}`);
 
@@ -71,18 +86,17 @@ app.get("/wecom/callback", async (req, reply) => {
 
   app.log.info(`[GET] Supabase response: ${res.status} - ${text}`);
 
-  reply
-    .code(res.status)
-    .header("content-type", "text/plain")
-    .send(text);
+  reply.code(res.status).header("content-type", "text/plain").send(text);
 });
 
-// WeCom -> Proxy -> Supabase (INBOUND MESSAGES - POST)
+// INBOUND MESSAGES - POST
 app.post("/wecom/callback", async (req, reply) => {
+  if (!SUPABASE_INBOUND_FORWARD_URL) {
+    throw new Error("Missing SUPABASE_INBOUND_FORWARD_URL");
+  }
+
   const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
-  const url = qs
-    ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}`
-    : SUPABASE_INBOUND_FORWARD_URL;
+  const url = qs ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}` : SUPABASE_INBOUND_FORWARD_URL;
 
   const body = typeof req.body === "string" ? req.body : "";
 
@@ -91,8 +105,10 @@ app.post("/wecom/callback", async (req, reply) => {
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { "content-type": req.headers["content-type"] || "text/xml" },
-    body
+    headers: {
+      "content-type": req.headers["content-type"] || "text/xml",
+    },
+    body,
   });
 
   const text = await res.text();
@@ -147,11 +163,16 @@ app.get("/wecom/kf-callback", async (req, reply) => {
     throw new Error("Missing SUPABASE_FUNCTIONS_URL");
   }
 
+  // Basic parameter sanity (WeCom sends all 4 for verification)
+  if (!msg_signature || !timestamp || !nonce || !echostr) {
+    app.log.warn({ msg_signature, timestamp, nonce, echostr }, "[GET] KF missing query params");
+  }
+
   const params = new URLSearchParams({
-    msg_signature,
-    timestamp,
-    nonce,
-    echostr
+    msg_signature: msg_signature || "",
+    timestamp: timestamp || "",
+    nonce: nonce || "",
+    echostr: echostr || "",
   });
 
   const url = `${SUPABASE_FUNCTIONS_URL}/inbound-wecom-kf?${params}`;
@@ -159,6 +180,8 @@ app.get("/wecom/kf-callback", async (req, reply) => {
 
   const res = await fetch(url, { method: "GET" });
   const text = await res.text();
+
+  app.log.info(`[GET] KF Supabase response: ${res.status} - ${text}`);
 
   reply.code(res.status).header("content-type", "text/plain").send(text);
 });
@@ -171,10 +194,14 @@ app.post("/wecom/kf-callback", async (req, reply) => {
     throw new Error("Missing SUPABASE_FUNCTIONS_URL");
   }
 
+  if (!msg_signature || !timestamp || !nonce) {
+    app.log.warn({ msg_signature, timestamp, nonce }, "[POST] KF missing query params");
+  }
+
   const params = new URLSearchParams({
-    msg_signature,
-    timestamp,
-    nonce
+    msg_signature: msg_signature || "",
+    timestamp: timestamp || "",
+    nonce: nonce || "",
   });
 
   const url = `${SUPABASE_FUNCTIONS_URL}/inbound-wecom-kf?${params}`;
@@ -183,13 +210,24 @@ app.post("/wecom/kf-callback", async (req, reply) => {
   app.log.info(`[POST] KF event forward -> ${url}`);
   app.log.info(`[POST] KF body length: ${body.length}`);
 
-  await fetch(url, {
-    method: "POST",
-    headers: { "content-type": req.headers["content-type"] || "text/xml" },
-    body
-  });
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": req.headers["content-type"] || "text/xml" },
+      body,
+    });
 
-  reply.code(200).header("content-type", "text/plain").send("success");
+    const text = await res.text();
+    app.log.info(`[POST] KF Supabase response: ${res.status} - ${text}`);
+
+    // WeCom expects a fast 200, even if downstream fails; we log the failure above.
+    return reply.code(200).header("content-type", "text/plain").send("success");
+  } catch (err) {
+    app.log.error({ err }, "[POST] KF forward failed (network/timeout)");
+
+    // Still return 200 to WeCom to avoid retries storms; investigate logs to fix.
+    return reply.code(200).header("content-type", "text/plain").send("success");
+  }
 });
 
 // Proxy -> WeCom KF API: sync messages (protected)
@@ -208,8 +246,8 @@ app.post("/wecom/kf-sync", async (req) => {
         cursor,
         token: syncToken,
         open_kfid,
-        limit: limit || 100
-      })
+        limit: limit || 100,
+      }),
     }
   );
 
@@ -228,7 +266,7 @@ app.post("/wecom/kf-send", async (req) => {
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ touser, open_kfid, msgtype, text })
+      body: JSON.stringify({ touser, open_kfid, msgtype, text }),
     }
   );
 
