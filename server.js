@@ -20,7 +20,9 @@ const {
   SUPABASE_INBOUND_FORWARD_URL,
   WECOM_CORP_ID,
   WECOM_SECRET,
-  WECOM_AGENT_ID
+  WECOM_AGENT_ID,
+  WECOM_KF_SECRET,
+  SUPABASE_FUNCTIONS_URL
 } = process.env;
 
 function requireAuth(req) {
@@ -62,14 +64,13 @@ app.get("/wecom/callback", async (req, reply) => {
     ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}`
     : SUPABASE_INBOUND_FORWARD_URL;
 
-  console.log(`[GET] Forwarding verification to: ${url}`);
+  app.log.info(`[GET] Forwarding verification to: ${url}`);
 
   const res = await fetch(url, { method: "GET" });
   const text = await res.text();
 
-  console.log(`[GET] Supabase response: ${res.status} - ${text}`);
+  app.log.info(`[GET] Supabase response: ${res.status} - ${text}`);
 
-  // Return plain text for WeCom verification
   reply
     .code(res.status)
     .header("content-type", "text/plain")
@@ -85,8 +86,8 @@ app.post("/wecom/callback", async (req, reply) => {
 
   const body = typeof req.body === "string" ? req.body : "";
 
-  console.log(`[POST] Forwarding message to: ${url}`);
-  console.log(`[POST] Body length: ${body.length}`);
+  app.log.info(`[POST] Forwarding message to: ${url}`);
+  app.log.info(`[POST] Body length: ${body.length}`);
 
   const res = await fetch(url, {
     method: "POST",
@@ -95,9 +96,143 @@ app.post("/wecom/callback", async (req, reply) => {
   });
 
   const text = await res.text();
-  console.log(`[POST] Supabase response: ${res.status} - ${text}`);
+  app.log.info(`[POST] Supabase response: ${res.status} - ${text}`);
 
   reply.code(res.status).send(text);
+});
+
+// ============================================
+// WeCom Customer Service (KF) Routes
+// ============================================
+
+// Get KF access token (cached in-memory)
+let kfAccessToken = null;
+let kfTokenExpiry = 0;
+
+async function getKFAccessToken() {
+  if (kfAccessToken && Date.now() < kfTokenExpiry) {
+    return kfAccessToken;
+  }
+
+  if (!WECOM_CORP_ID || !WECOM_KF_SECRET) {
+    throw new Error("Missing WECOM_CORP_ID or WECOM_KF_SECRET");
+  }
+
+  const response = await fetch(
+    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${WECOM_CORP_ID}&corpsecret=${WECOM_KF_SECRET}`
+  );
+  const data = await response.json();
+
+  if (data.access_token) {
+    kfAccessToken = data.access_token;
+    kfTokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
+    return kfAccessToken;
+  }
+
+  throw new Error(`KF token error: ${data.errmsg || JSON.stringify(data)}`);
+}
+
+// GET /wecom/kf-token - Return KF access token (protected)
+app.get("/wecom/kf-token", async (req) => {
+  requireAuth(req);
+  const token = await getKFAccessToken();
+  return { access_token: token };
+});
+
+// WeCom KF -> Proxy -> Supabase (URL VERIFICATION - GET)
+app.get("/wecom/kf-callback", async (req, reply) => {
+  const { msg_signature, timestamp, nonce, echostr } = req.query || {};
+
+  if (!SUPABASE_FUNCTIONS_URL) {
+    throw new Error("Missing SUPABASE_FUNCTIONS_URL");
+  }
+
+  const params = new URLSearchParams({
+    msg_signature,
+    timestamp,
+    nonce,
+    echostr
+  });
+
+  const url = `${SUPABASE_FUNCTIONS_URL}/inbound-wecom-kf?${params}`;
+  app.log.info(`[GET] KF verification forward -> ${url}`);
+
+  const res = await fetch(url, { method: "GET" });
+  const text = await res.text();
+
+  reply.code(res.status).header("content-type", "text/plain").send(text);
+});
+
+// WeCom KF -> Proxy -> Supabase (INBOUND EVENTS - POST)
+app.post("/wecom/kf-callback", async (req, reply) => {
+  const { msg_signature, timestamp, nonce } = req.query || {};
+
+  if (!SUPABASE_FUNCTIONS_URL) {
+    throw new Error("Missing SUPABASE_FUNCTIONS_URL");
+  }
+
+  const params = new URLSearchParams({
+    msg_signature,
+    timestamp,
+    nonce
+  });
+
+  const url = `${SUPABASE_FUNCTIONS_URL}/inbound-wecom-kf?${params}`;
+
+  const body = typeof req.body === "string" ? req.body : "";
+  app.log.info(`[POST] KF event forward -> ${url}`);
+  app.log.info(`[POST] KF body length: ${body.length}`);
+
+  await fetch(url, {
+    method: "POST",
+    headers: { "content-type": req.headers["content-type"] || "text/xml" },
+    body
+  });
+
+  reply.code(200).header("content-type", "text/plain").send("success");
+});
+
+// Proxy -> WeCom KF API: sync messages (protected)
+app.post("/wecom/kf-sync", async (req) => {
+  requireAuth(req);
+  const token = await getKFAccessToken();
+
+  const { cursor, token: syncToken, open_kfid, limit } = req.body || {};
+
+  const res = await fetch(
+    `https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token=${token}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cursor,
+        token: syncToken,
+        open_kfid,
+        limit: limit || 100
+      })
+    }
+  );
+
+  return res.json();
+});
+
+// Proxy -> WeCom KF API: send message (protected)
+app.post("/wecom/kf-send", async (req) => {
+  requireAuth(req);
+  const token = await getKFAccessToken();
+
+  const { touser, open_kfid, msgtype, text } = req.body || {};
+
+  const res = await fetch(
+    `https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token=${token}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ touser, open_kfid, msgtype, text })
+    }
+  );
+
+  return res.json();
 });
 
 const port = process.env.PORT ? Number(process.env.PORT) : 8080;
