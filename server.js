@@ -1,15 +1,10 @@
 import Fastify from "fastify";
-import rawBody from "@fastify/raw-body";
 import fetch from "node-fetch";
 import { getWecomAccessToken, wecomSendText } from "./wecom.js";
 
-const app = Fastify({ logger: true });
-
-await app.register(rawBody, {
-  field: "rawBody",
-  global: false,
-  encoding: "utf8",
-  runFirst: true
+const app = Fastify({
+  logger: true,
+  bodyLimit: 5 * 1024 * 1024 // 5MB
 });
 
 const {
@@ -57,25 +52,24 @@ app.post("/wecom/send", async (req, reply) => {
 });
 
 // WeCom -> Proxy -> Supabase
-app.post(
-  "/wecom/callback",
-  { config: { rawBody: true } },
-  async (req, reply) => {
-    const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
-    const url = qs
-      ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}`
-      : SUPABASE_INBOUND_FORWARD_URL;
+// We want the raw XML body as a string. Fastify will parse as string if content-type is text/xml.
+app.post("/wecom/callback", async (req, reply) => {
+  const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
+  const url = qs
+    ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}`
+    : SUPABASE_INBOUND_FORWARD_URL;
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": req.headers["content-type"] || "text/xml" },
-      body: req.rawBody || ""
-    });
+  const body = typeof req.body === "string" ? req.body : "";
 
-    const text = await res.text();
-    reply.code(res.status).send(text);
-  }
-);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": req.headers["content-type"] || "text/xml" },
+    body
+  });
+
+  const text = await res.text();
+  reply.code(res.status).send(text);
+});
 
 const port = process.env.PORT ? Number(process.env.PORT) : 8080;
-app.listen({ port, host: "0.0.0.0" });
+app.lis
