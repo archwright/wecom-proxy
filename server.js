@@ -1,10 +1,13 @@
+// server.js
+
 import Fastify from "fastify";
 import fetch from "node-fetch";
+import crypto from "crypto";
 import { getWecomAccessToken, wecomSendText } from "./wecom.js";
 
 const app = Fastify({
   logger: true,
-  bodyLimit: 5 * 1024 * 1024,
+  bodyLimit: 5 * 1024 * 1024
 });
 
 // Register raw body parsing for XML
@@ -23,6 +26,10 @@ const {
   WECOM_AGENT_ID,
   WECOM_KF_SECRET,
   SUPABASE_FUNCTIONS_URL,
+
+  // Used ONLY for WeCom KF URL verification (GET /wecom/kf-callback)
+  WECOM_KF_TOKEN,
+  WECOM_KF_ENCODING_AES_KEY
 } = process.env;
 
 function requireAuth(req) {
@@ -35,15 +42,66 @@ function requireAuth(req) {
   }
 }
 
-/**
- * Health check for Fly
- * Fly will call GET /health to decide if the machine is routable.
- */
+// Health endpoint for Fly health checks
 app.get("/health", async () => ({ ok: true }));
 
-// ================================
+// =============================
+// WeCom crypto helpers (KF GET verification)
+// =============================
+function sha1Hex(str) {
+  return crypto.createHash("sha1").update(str).digest("hex");
+}
+
+function verifyWecomSignature({ token, timestamp, nonce, signature, data }) {
+  const arr = [token, timestamp, nonce, data].sort();
+  const computed = sha1Hex(arr.join(""));
+  return computed === signature;
+}
+
+function decryptWecomEchoStr({ encodingAESKey, corpId, echostrB64 }) {
+  const keyStr = (encodingAESKey || "").trim();
+  if (keyStr.length !== 43) {
+    throw new Error(`EncodingAESKey length ${keyStr.length} != 43`);
+  }
+
+  // WeCom uses 43-char base64 without '=' padding
+  const aesKey = Buffer.from(keyStr + "=", "base64"); // 32 bytes
+  if (aesKey.length !== 32) {
+    throw new Error(`AES key length ${aesKey.length} != 32`);
+  }
+
+  // IV is first 16 bytes of key
+  const iv = aesKey.subarray(0, 16);
+
+  // Base64 decode echostr
+  const cipherBuf = Buffer.from(echostrB64, "base64");
+
+  // AES-256-CBC decrypt (PKCS7 padding handled by Node)
+  const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
+  const plain = Buffer.concat([decipher.update(cipherBuf), decipher.final()]);
+
+  // Plain structure: random(16) + msg_len(4) + msg + corpId
+  const msgLen = plain.readUInt32BE(16);
+  const msgStart = 20;
+  const msgEnd = msgStart + msgLen;
+
+  if (msgEnd > plain.length) {
+    throw new Error(`Bad msgLen ${msgLen} exceeds buffer ${plain.length}`);
+  }
+
+  const msg = plain.subarray(msgStart, msgEnd).toString("utf8");
+  const corpFromMsg = plain.subarray(msgEnd).toString("utf8");
+
+  if (corpId && corpFromMsg && corpFromMsg !== corpId) {
+    throw new Error(`CorpID mismatch got=${corpFromMsg} expected=${corpId}`);
+  }
+
+  return msg;
+}
+
+// ============================================
 // Supabase -> Proxy -> WeCom (outbound messages)
-// ================================
+// ============================================
 app.post("/wecom/send", async (req, reply) => {
   requireAuth(req);
   const { toUser, content } = req.body || {};
@@ -53,29 +111,25 @@ app.post("/wecom/send", async (req, reply) => {
 
   const token = await getWecomAccessToken({
     corpId: WECOM_CORP_ID,
-    corpSecret: WECOM_SECRET,
+    corpSecret: WECOM_SECRET
   });
 
   const result = await wecomSendText({
     accessToken: token,
     agentId: WECOM_AGENT_ID,
     toUser,
-    content,
+    content
   });
 
   return { ok: true, result };
 });
 
-// ================================
-// WeCom -> Proxy -> Supabase (Standard callback)
-// ================================
+// ============================================
+// WeCom -> Proxy -> Supabase (Enterprise callback)
+// ============================================
 
 // URL VERIFICATION - GET
 app.get("/wecom/callback", async (req, reply) => {
-  if (!SUPABASE_INBOUND_FORWARD_URL) {
-    throw new Error("Missing SUPABASE_INBOUND_FORWARD_URL");
-  }
-
   const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
   const url = qs ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}` : SUPABASE_INBOUND_FORWARD_URL;
 
@@ -91,10 +145,6 @@ app.get("/wecom/callback", async (req, reply) => {
 
 // INBOUND MESSAGES - POST
 app.post("/wecom/callback", async (req, reply) => {
-  if (!SUPABASE_INBOUND_FORWARD_URL) {
-    throw new Error("Missing SUPABASE_INBOUND_FORWARD_URL");
-  }
-
   const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
   const url = qs ? `${SUPABASE_INBOUND_FORWARD_URL}?${qs}` : SUPABASE_INBOUND_FORWARD_URL;
 
@@ -105,10 +155,8 @@ app.post("/wecom/callback", async (req, reply) => {
 
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "content-type": req.headers["content-type"] || "text/xml",
-    },
-    body,
+    headers: { "content-type": req.headers["content-type"] || "text/xml" },
+    body
   });
 
   const text = await res.text();
@@ -155,38 +203,57 @@ app.get("/wecom/kf-token", async (req) => {
   return { access_token: token };
 });
 
-// WeCom KF -> Proxy -> Supabase (URL VERIFICATION - GET)
+// WeCom KF -> Proxy (URL VERIFICATION - GET) - handled in Fly (NOT Supabase)
 app.get("/wecom/kf-callback", async (req, reply) => {
-  const { msg_signature, timestamp, nonce, echostr } = req.query || {};
+  try {
+    const { msg_signature, timestamp, nonce, echostr } = req.query || {};
 
-  if (!SUPABASE_FUNCTIONS_URL) {
-    throw new Error("Missing SUPABASE_FUNCTIONS_URL");
+    if (!msg_signature || !timestamp || !nonce || !echostr) {
+      reply.code(400).type("text/plain").send("missing params");
+      return;
+    }
+
+    if (!WECOM_KF_TOKEN || !WECOM_KF_ENCODING_AES_KEY || !WECOM_CORP_ID) {
+      app.log.error("[KF] Missing Fly env vars for verification", {
+        token: !!WECOM_KF_TOKEN,
+        encodingAESKeyLen: (WECOM_KF_ENCODING_AES_KEY || "").length,
+        corpId: !!WECOM_CORP_ID
+      });
+      reply.code(500).type("text/plain").send("server misconfigured");
+      return;
+    }
+
+    // Verify signature: SHA1(sort(token,timestamp,nonce,echostr))
+    const ok = verifyWecomSignature({
+      token: WECOM_KF_TOKEN,
+      timestamp: String(timestamp),
+      nonce: String(nonce),
+      signature: String(msg_signature),
+      data: String(echostr)
+    });
+
+    if (!ok) {
+      app.log.warn("[KF] Signature verification failed (GET)");
+      reply.code(403).type("text/plain").send("Verification failed");
+      return;
+    }
+
+    // Decrypt echostr and return plaintext
+    const plaintext = decryptWecomEchoStr({
+      encodingAESKey: WECOM_KF_ENCODING_AES_KEY,
+      corpId: WECOM_CORP_ID,
+      echostrB64: String(echostr)
+    });
+
+    app.log.info("[KF] Verification OK (GET)");
+    reply.code(200).type("text/plain").send(plaintext);
+  } catch (err) {
+    app.log.error({ err }, "[KF] Verification error (GET)");
+    reply.code(500).type("text/plain").send("Verification failed");
   }
-
-  // Basic parameter sanity (WeCom sends all 4 for verification)
-  if (!msg_signature || !timestamp || !nonce || !echostr) {
-    app.log.warn({ msg_signature, timestamp, nonce, echostr }, "[GET] KF missing query params");
-  }
-
-  const params = new URLSearchParams({
-    msg_signature: msg_signature || "",
-    timestamp: timestamp || "",
-    nonce: nonce || "",
-    echostr: echostr || "",
-  });
-
-  const url = `${SUPABASE_FUNCTIONS_URL}/inbound-wecom-kf?${params}`;
-  app.log.info(`[GET] KF verification forward -> ${url}`);
-
-  const res = await fetch(url, { method: "GET" });
-  const text = await res.text();
-
-  app.log.info(`[GET] KF Supabase response: ${res.status} - ${text}`);
-
-  reply.code(res.status).header("content-type", "text/plain").send(text);
 });
 
-// WeCom KF -> Proxy -> Supabase (INBOUND EVENTS - POST)
+// WeCom KF -> Proxy -> Supabase (INBOUND EVENTS - POST) - keep forwarding
 app.post("/wecom/kf-callback", async (req, reply) => {
   const { msg_signature, timestamp, nonce } = req.query || {};
 
@@ -194,14 +261,10 @@ app.post("/wecom/kf-callback", async (req, reply) => {
     throw new Error("Missing SUPABASE_FUNCTIONS_URL");
   }
 
-  if (!msg_signature || !timestamp || !nonce) {
-    app.log.warn({ msg_signature, timestamp, nonce }, "[POST] KF missing query params");
-  }
-
   const params = new URLSearchParams({
-    msg_signature: msg_signature || "",
-    timestamp: timestamp || "",
-    nonce: nonce || "",
+    msg_signature,
+    timestamp,
+    nonce
   });
 
   const url = `${SUPABASE_FUNCTIONS_URL}/inbound-wecom-kf?${params}`;
@@ -210,24 +273,17 @@ app.post("/wecom/kf-callback", async (req, reply) => {
   app.log.info(`[POST] KF event forward -> ${url}`);
   app.log.info(`[POST] KF body length: ${body.length}`);
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": req.headers["content-type"] || "text/xml" },
-      body,
-    });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": req.headers["content-type"] || "text/xml" },
+    body
+  });
 
-    const text = await res.text();
-    app.log.info(`[POST] KF Supabase response: ${res.status} - ${text}`);
+  const text = await res.text();
+  app.log.info(`[POST] KF Supabase response: ${res.status} - ${text}`);
 
-    // WeCom expects a fast 200, even if downstream fails; we log the failure above.
-    return reply.code(200).header("content-type", "text/plain").send("success");
-  } catch (err) {
-    app.log.error({ err }, "[POST] KF forward failed (network/timeout)");
-
-    // Still return 200 to WeCom to avoid retries storms; investigate logs to fix.
-    return reply.code(200).header("content-type", "text/plain").send("success");
-  }
+  // Always respond success to WeCom to avoid retries
+  reply.code(200).header("content-type", "text/plain").send("success");
 });
 
 // Proxy -> WeCom KF API: sync messages (protected)
@@ -246,8 +302,8 @@ app.post("/wecom/kf-sync", async (req) => {
         cursor,
         token: syncToken,
         open_kfid,
-        limit: limit || 100,
-      }),
+        limit: limit || 100
+      })
     }
   );
 
@@ -266,7 +322,7 @@ app.post("/wecom/kf-send", async (req) => {
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ touser, open_kfid, msgtype, text }),
+      body: JSON.stringify({ touser, open_kfid, msgtype, text })
     }
   );
 
