@@ -19,12 +19,14 @@ export async function getWecomAccessToken({ corpId, corpSecret }) {
   }
 
   cachedToken = data.access_token;
-  tokenExpiryMs = now + (data.expires_in - 60) * 1000;
+  tokenExpiryMs = now + (data.expires_in - 60) * 1000; // 60s buffer
   return cachedToken;
 }
 
 export async function wecomSendText({ accessToken, agentId, toUser, content }) {
-  const url = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(accessToken)}`;
+  const url = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(
+    accessToken
+  )}`;
 
   const payload = {
     touser: toUser,
