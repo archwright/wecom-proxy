@@ -375,6 +375,106 @@ app.post("/wecom/kf-customer-batchget", async (req, reply) => {
   }
 });
 
+// ============================================
+// WeCom External Groups Routes (Phase 2)
+// ============================================
+
+// Proxy -> WeCom: Create external group chat (protected)
+app.post("/wecom/externalcontact/groupchat/create", async (req, reply) => {
+  try {
+    requireAuth(req);
+    
+    const token = await getWecomAccessToken({
+      corpId: WECOM_CORP_ID,
+      corpSecret: WECOM_SECRET
+    });
+
+    const { name, owner, userlist, chat_id } = req.body || {};
+
+    if (!name || !owner || !Array.isArray(userlist)) {
+      return reply.code(400).send({
+        errcode: -1,
+        errmsg: "Missing required fields: name, owner, userlist"
+      });
+    }
+
+    const res = await fetch(
+      `https://qyapi.weixin.qq.com/cgi-bin/externalcontact/groupchat/create?access_token=${encodeURIComponent(token)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name,
+          owner,
+          userlist,
+          chat_id
+        })
+      }
+    );
+
+    const data = await res.json();
+    app.log.info({ data }, "[external-group-create] WeCom response");
+    return reply.send(data);
+  } catch (error) {
+    app.log.error({ error }, "[external-group-create] Error");
+    return reply.code(500).send({
+      errcode: -1,
+      errmsg: error?.message || "Unknown error"
+    });
+  }
+});
+
+// Proxy -> WeCom: Send message to app chat (external group) (protected)
+app.post("/wecom/appchat/send", async (req, reply) => {
+  try {
+    requireAuth(req);
+    
+    const token = await getWecomAccessToken({
+      corpId: WECOM_CORP_ID,
+      corpSecret: WECOM_SECRET
+    });
+
+    const { chatid, msgtype, text, safe } = req.body || {};
+
+    if (!chatid || !msgtype) {
+      return reply.code(400).send({
+        errcode: -1,
+        errmsg: "Missing required fields: chatid, msgtype"
+      });
+    }
+
+    const payload = {
+      chatid,
+      msgtype,
+      safe: safe || 0
+    };
+
+    // Add message content based on type
+    if (msgtype === "text" && text) {
+      payload.text = text;
+    }
+
+    const res = await fetch(
+      `https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token=${encodeURIComponent(token)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      }
+    );
+
+    const data = await res.json();
+    app.log.info({ data }, "[appchat-send] WeCom response");
+    return reply.send(data);
+  } catch (error) {
+    app.log.error({ error }, "[appchat-send] Error");
+    return reply.code(500).send({
+      errcode: -1,
+      errmsg: error?.message || "Unknown error"
+    });
+  }
+});
+
 const port = process.env.PORT ? Number(process.env.PORT) : 8080;
 
 try {
