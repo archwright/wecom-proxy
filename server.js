@@ -183,12 +183,15 @@ async function getKFAccessToken() {
   }
 
   const response = await fetch(
-    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${WECOM_CORP_ID}&corpsecret=${WECOM_KF_SECRET}`
+    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(
+      WECOM_CORP_ID
+    )}&corpsecret=${encodeURIComponent(WECOM_KF_SECRET)}`
   );
   const data = await response.json();
 
-  if (data.access_token) {
+  if (response.ok && data.access_token && data.errcode === 0) {
     kfAccessToken = data.access_token;
+    // keep a buffer so it refreshes early
     kfTokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
     return kfAccessToken;
   }
@@ -294,7 +297,7 @@ app.post("/wecom/kf-sync", async (req) => {
   const { cursor, token: syncToken, open_kfid, limit } = req.body || {};
 
   const res = await fetch(
-    `https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token=${token}`,
+    `https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token=${encodeURIComponent(token)}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -318,7 +321,7 @@ app.post("/wecom/kf-send", async (req) => {
   const { touser, open_kfid, msgtype, text } = req.body || {};
 
   const res = await fetch(
-    `https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token=${token}`,
+    `https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token=${encodeURIComponent(token)}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -329,7 +332,45 @@ app.post("/wecom/kf-send", async (req) => {
   return res.json();
 });
 
+// ✅ NEW: Proxy -> WeCom KF API: customer batchget (protected)
+app.post("/wecom/kf-customer-batchget", async (req, reply) => {
+  try {
+    requireAuth(req);
+    const token = await getKFAccessToken();
+
+    const { external_userid_list } = req.body || {};
+
+    if (!Array.isArray(external_userid_list) || external_userid_list.length === 0) {
+      return reply.code(400).send({
+        errcode: -1,
+        errmsg: "external_userid_list must be a non-empty array"
+      });
+    }
+
+    const res = await fetch(
+      `https://qyapi.weixin.qq.com/cgi-bin/kf/customer/batchget?access_token=${encodeURIComponent(
+        token
+      )}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ external_userid_list })
+      }
+    );
+
+    const data = await res.json();
+    return reply.send(data);
+  } catch (error) {
+    app.log.error({ error }, "[kf-customer-batchget] Error");
+    return reply.code(500).send({
+      errcode: -1,
+      errmsg: error?.message || "Unknown error"
+    });
+  }
+});
+
 const port = process.env.PORT ? Number(process.env.PORT) : 8080;
+
 try {
   await app.listen({ port, host: "0.0.0.0" });
   console.log(`Server running on port ${port}`);
