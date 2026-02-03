@@ -45,6 +45,12 @@ function requireAuth(req) {
 // Health endpoint for Fly health checks
 app.get("/health", async () => ({ ok: true }));
 
+// Debug: list registered routes (protected)
+app.get("/routes", async (req, reply) => {
+  requireAuth(req);
+  reply.type("text/plain").send(app.printRoutes());
+});
+
 // =============================
 // WeCom crypto helpers (KF GET verification)
 // =============================
@@ -332,7 +338,7 @@ app.post("/wecom/kf-send", async (req) => {
   return res.json();
 });
 
-// ✅ NEW: Proxy -> WeCom KF API: customer batchget (protected)
+// ✅ Proxy -> WeCom KF API: customer batchget (protected)
 app.post("/wecom/kf-customer-batchget", async (req, reply) => {
   try {
     requireAuth(req);
@@ -373,6 +379,11 @@ const port = process.env.PORT ? Number(process.env.PORT) : 8080;
 
 try {
   await app.listen({ port, host: "0.0.0.0" });
+
+  // Ensure routes are registered and print them to logs
+  await app.ready();
+  app.log.info("Registered routes:\n" + app.printRoutes());
+
   console.log(`Server running on port ${port}`);
 } catch (err) {
   app.log.error(err);
