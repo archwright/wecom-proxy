@@ -42,6 +42,34 @@ function requireAuth(req) {
   }
 }
 
+// ============================================
+// Safe upstream response parser
+// Returns parsed data, or sends a 502 and returns null.
+// ============================================
+async function safeParseUpstream(res, reply, route) {
+  const raw = await res.text();
+  if (!raw || !raw.trim()) {
+    reply.log.error({ upstream_status: res.status, route }, 'Empty upstream WeCom body');
+    reply.code(502).send({
+      errcode: -1,
+      errmsg: `Empty upstream WeCom response on ${route} — check secret / open_kfid / IP allowlist`,
+      upstream_status: res.status,
+    });
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    reply.log.error({ upstream_status: res.status, body_preview: raw.slice(0, 200), route }, 'Unparseable WeCom body');
+    reply.code(502).send({
+      errcode: -1,
+      errmsg: `Unparseable upstream WeCom body on ${route}: ${e.message}`,
+      upstream_status: res.status,
+      body_preview: raw.slice(0, 200),
+    });
+    return null;
+  }
+}
 // Health endpoint for Fly health checks
 app.get("/health", async () => ({ ok: true }));
 
@@ -49,7 +77,21 @@ app.get("/health", async () => ({ ok: true }));
 app.get("/debug/egress-ip", async (req) => {
   requireAuth(req);
   const res = await fetch("https://api.ipify.org?format=json");
-  return res.json();
+  const data = await safeParseUpstream(res, reply, 'kf-sync');
+  if (data === null) return;
+  return reply.send(data);
+});
+
+
+// Debug: which secrets are loaded (last 4 chars only)
+app.get('/debug/which-secret', async (req, reply) => {
+  if (req.headers['authorization'] !== `Bearer ${PROXY_SHARED_SECRET}`) {
+    return reply.code(401).send();
+  }
+  return {
+    kfSecretLast4: (WECOM_KF_SECRET || '').slice(-4),
+    contactsSecretLast4: (WECOM_SECRET || '').slice(-4),
+  };
 });
 
 // Debug: list registered routes (protected)
@@ -182,36 +224,12 @@ app.post("/wecom/callback", async (req, reply) => {
 // WeCom Customer Service (KF) Routes
 // ============================================
 
-// Get KF access token (cached in-memory)
-let kfAccessToken = null;
-let kfTokenExpiry = 0;
-
+// Delegate to wecom.js which caches per (corpId, secret) pair — no local cache needed
 async function getKFAccessToken() {
-  if (kfAccessToken && Date.now() < kfTokenExpiry) {
-    return kfAccessToken;
-  }
-
   if (!WECOM_CORP_ID || !WECOM_KF_SECRET) {
     throw new Error("Missing WECOM_CORP_ID or WECOM_KF_SECRET");
   }
-
-  const response = await fetch(
-    `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(
-      WECOM_CORP_ID
-    )}&corpsecret=${encodeURIComponent(WECOM_KF_SECRET)}`
-  );
-  const data = await response.json();
-
-  app.log.info({ errcode: data.errcode, has_token: !!data.access_token }, "[kf-token] WeCom gettoken response");
-
-  if (response.ok && data.access_token && data.errcode === 0) {
-    kfAccessToken = data.access_token;
-    // keep a buffer so it refreshes early
-    kfTokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
-    return kfAccessToken;
-  }
-
-  throw new Error(`KF token error: ${data.errmsg || JSON.stringify(data)}`);
+  return getWecomAccessToken({ corpId: WECOM_CORP_ID, corpSecret: WECOM_KF_SECRET });
 }
 
 // GET /wecom/kf-token - Return KF access token (protected)
@@ -305,7 +323,7 @@ app.post("/wecom/kf-callback", async (req, reply) => {
 });
 
 // Proxy -> WeCom KF API: sync messages (protected)
-app.post("/wecom/kf-sync", async (req) => {
+app.post("/wecom/kf-sync", async (req, reply) => {
   requireAuth(req);
   const token = await getKFAccessToken();
 
@@ -329,7 +347,7 @@ app.post("/wecom/kf-sync", async (req) => {
 });
 
 // Proxy -> WeCom KF API: send message (protected)
-app.post("/wecom/kf-send", async (req) => {
+app.post("/wecom/kf-send", async (req, reply) => {
   requireAuth(req);
   const token = await getKFAccessToken();
 
@@ -349,9 +367,11 @@ app.post("/wecom/kf-send", async (req) => {
         }),
       }
     );
-    const transferData = await transferRes.json();
+    const tRaw = await transferRes.text();
+    let transferData;
+    try { transferData = tRaw ? JSON.parse(tRaw) : {}; } catch (e) { transferData = { parse_error: tRaw.slice(0, 200) }; }
     // Ignore "already assigned" errors (60028 family); log others but continue
-    console.log("[kf-send] transfer_to_servicer:", transferData);
+    app.log.info({ transferData }, "[kf-send] transfer_to_servicer");
   }
 
   // Do NOT include servicer_userid in send_msg body — WeCom rejects it
@@ -371,14 +391,15 @@ app.post("/wecom/kf-send", async (req) => {
     }
   );
 
-  const data = await res.json();
+  const data = await safeParseUpstream(res, reply, 'kf-send');
+  if (data === null) return;
 
   app.log.info({
     http_status: res.status,
     wecom_response: data
   }, "[kf-send] WeCom API response");
 
-  return data;
+  return reply.send(data);
 });
 
 // ✅ Proxy -> WeCom KF API: customer batchget (protected)
@@ -407,7 +428,8 @@ app.post("/wecom/kf-customer-batchget", async (req, reply) => {
       }
     );
 
-    const data = await res.json();
+    const data = await safeParseUpstream(res, reply, 'kf-customer-batchget');
+    if (data === null) return;
     return reply.send(data);
   } catch (error) {
     app.log.error({ error }, "[kf-customer-batchget] Error");
@@ -455,7 +477,8 @@ app.post("/wecom/externalcontact/groupchat/create", async (req, reply) => {
       }
     );
 
-    const data = await res.json();
+    const data = await safeParseUpstream(res, reply, 'externalcontact/groupchat/create');
+    if (data === null) return;
     app.log.info({ data }, "[external-group-create] WeCom response");
     return reply.send(data);
   } catch (error) {
@@ -506,7 +529,8 @@ app.post("/wecom/appchat/send", async (req, reply) => {
       }
     );
 
-    const data = await res.json();
+    const data = await safeParseUpstream(res, reply, 'appchat/send');
+    if (data === null) return;
     app.log.info({ data }, "[appchat-send] WeCom response");
     return reply.send(data);
   } catch (error) {

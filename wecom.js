@@ -1,31 +1,45 @@
 import fetch from "node-fetch";
 
-let cachedToken = null;
-let tokenExpiryMs = 0;
+// Keyed by `${corpId}:${corpSecret}` to prevent KF and enterprise tokens colliding
+const tokenCache = new Map();
 
 /**
- * Generic WeCom access token fetcher
- * Used for BOTH enterprise + KF tokens (different secrets)
+ * Generic WeCom access token fetcher with per-secret caching.
+ * Used for BOTH enterprise + KF tokens (different secrets = different cache entries).
  */
 export async function getWecomAccessToken({ corpId, corpSecret }) {
+  const cacheKey = `${corpId}:${corpSecret}`;
   const now = Date.now();
-  if (cachedToken && now < tokenExpiryMs) return cachedToken;
+  const cached = tokenCache.get(cacheKey);
+  if (cached && now < cached.expiryMs) return cached.token;
 
   const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(
     corpId
   )}&corpsecret=${encodeURIComponent(corpSecret)}`;
 
   const res = await fetch(url);
-  const data = await res.json();
+  const raw = await res.text();
+
+  if (!raw || !raw.trim()) {
+    throw new Error(`gettoken: empty response from WeCom (HTTP ${res.status})`);
+  }
+
+  let data;
+  try { data = JSON.parse(raw); }
+  catch (e) {
+    throw new Error(`gettoken: unparseable response: ${raw.slice(0, 200)}`);
+  }
 
   if (!res.ok || data.errcode !== 0) {
     throw new Error(`gettoken failed: ${JSON.stringify(data)}`);
   }
 
-  cachedToken = data.access_token;
-  tokenExpiryMs = now + (data.expires_in - 60) * 1000; // 60s buffer
+  tokenCache.set(cacheKey, {
+    token: data.access_token,
+    expiryMs: now + (data.expires_in - 60) * 1000 // 60s buffer
+  });
 
-  return cachedToken;
+  return data.access_token;
 }
 
 /**
@@ -68,7 +82,11 @@ export async function wecomSendText({ accessToken, agentId, toUser, content }) {
     body: JSON.stringify(payload)
   });
 
-  const data = await res.json();
+  const raw = await res.text();
+  if (!raw || !raw.trim()) throw new Error(`message/send: empty response (HTTP ${res.status})`);
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { throw new Error(`message/send: unparseable: ${raw.slice(0, 200)}`); }
+
   if (!res.ok || data.errcode !== 0) {
     throw new Error(`message/send failed: ${JSON.stringify(data)}`);
   }
@@ -97,7 +115,10 @@ export async function kfCustomerBatchGet({ external_userid_list }) {
     }
   );
 
-  const data = await res.json();
+  const raw = await res.text();
+  if (!raw || !raw.trim()) throw new Error(`kf/customer/batchget: empty response (HTTP ${res.status})`);
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { throw new Error(`kf/customer/batchget: unparseable: ${raw.slice(0, 200)}`); }
 
   if (!res.ok || data.errcode !== 0) {
     throw new Error(`kf/customer/batchget failed: ${JSON.stringify(data)}`);
