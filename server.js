@@ -333,7 +333,28 @@ app.post("/wecom/kf-send", async (req) => {
   requireAuth(req);
   const token = await getKFAccessToken();
 
-  const { touser, open_kfid, msgtype, text } = req.body || {};
+  const { touser, open_kfid, servicer_userid, msgtype, text } = req.body || {};
+
+  // If servicer_userid is provided, transfer the customer to that servicer first
+  if (servicer_userid) {
+    const transferRes = await fetch(
+      `https://qyapi.weixin.qq.com/cgi-bin/kf/customer/transfer_to_servicer?access_token=${token}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          open_kfid,
+          external_userid_list: [touser],
+          servicer_userid,
+        }),
+      }
+    );
+    const transferData = await transferRes.json();
+    // Ignore "already assigned" errors (60028 family); log others but continue
+    console.log("[kf-send] transfer_to_servicer:", transferData);
+  }
+
+  // Do NOT include servicer_userid in send_msg body — WeCom rejects it
   const payload = { touser, open_kfid, msgtype, text };
 
   app.log.info({
