@@ -45,6 +45,13 @@ function requireAuth(req) {
 // Health endpoint for Fly health checks
 app.get("/health", async () => ({ ok: true }));
 
+// Debug: confirm actual outbound egress IP
+app.get("/debug/egress-ip", async (req) => {
+  requireAuth(req);
+  const res = await fetch("https://api.ipify.org?format=json");
+  return res.json();
+});
+
 // Debug: list registered routes (protected)
 app.get("/routes", async (req, reply) => {
   requireAuth(req);
@@ -195,6 +202,8 @@ async function getKFAccessToken() {
   );
   const data = await response.json();
 
+  app.log.info({ errcode: data.errcode, has_token: !!data.access_token }, "[kf-token] WeCom gettoken response");
+
   if (response.ok && data.access_token && data.errcode === 0) {
     kfAccessToken = data.access_token;
     // keep a buffer so it refreshes early
@@ -325,17 +334,30 @@ app.post("/wecom/kf-send", async (req) => {
   const token = await getKFAccessToken();
 
   const { touser, open_kfid, msgtype, text } = req.body || {};
+  const payload = { touser, open_kfid, msgtype, text };
+
+  app.log.info({
+    token_preview: `${token.slice(0, 6)}...${token.slice(-4)}`,
+    payload
+  }, "[kf-send] Calling WeCom API");
 
   const res = await fetch(
     `https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token=${encodeURIComponent(token)}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ touser, open_kfid, msgtype, text })
+      body: JSON.stringify(payload)
     }
   );
 
-  return res.json();
+  const data = await res.json();
+
+  app.log.info({
+    http_status: res.status,
+    wecom_response: data
+  }, "[kf-send] WeCom API response");
+
+  return data;
 });
 
 // ✅ Proxy -> WeCom KF API: customer batchget (protected)
