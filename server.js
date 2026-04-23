@@ -219,7 +219,7 @@ app.post("/wecom/callback", async (req, reply) => {
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { "content-type": req.headers["content-type"] || "text/xml" },
+    headers: { "content-type": req.headers["content-type"] || "text/xml", "authorization": `Bearer ${PROXY_SHARED_SECRET}` },
     body
   });
 
@@ -281,7 +281,7 @@ app.post("/wechat/callback", async (req, reply) => {
     app.log.info(`[WeChat] Forwarding to ${url}`);
     fetch(url, {
       method: "POST",
-      headers: { "content-type": req.headers["content-type"] || "text/xml" },
+      headers: { "content-type": req.headers["content-type"] || "text/xml", "authorization": `Bearer ${PROXY_SHARED_SECRET}` },
       body: rawXml,
     })
       .then((r) => app.log.info({ status: r.status }, "[WeChat] Supabase edge function response"))
