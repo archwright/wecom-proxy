@@ -233,17 +233,30 @@ app.post("/wecom/callback", async (req, reply) => {
 // WeChat Service Account Webhook Routes
 // ============================================
 
-// GET /wechat/callback
-// Phase 1: return plain-text placeholder while WECHAT_TOKEN is not yet set.
-// Phase 2 (TODO): verify msg_signature + decrypt echostr once Token/AESKey are provided.
+// GET /wechat/callback — WeChat URL verification (SHA1 signature check, plain/compat mode)
 app.get("/wechat/callback", async (req, reply) => {
-  app.log.info({ query: req.query }, "[WeChat] GET /wechat/callback - URL verification hit");
+  const { signature, echostr, timestamp, nonce } = req.query || {};
+  app.log.info({ signature, timestamp, nonce }, "[WeChat] GET /wechat/callback - verification attempt");
+
   if (!WECHAT_CONFIG.token) {
-    app.log.warn("[WeChat] WECHAT_TOKEN not set — returning placeholder (verification not enforced)");
-    return reply.code(200).type("text/plain").send("wechat callback online");
+    app.log.error("[WeChat] WECHAT_TOKEN not configured — cannot verify");
+    return reply.code(500).type("text/plain").send("server misconfigured");
   }
-  // TODO: implement SHA1 signature check + AES echostr decrypt when token is configured
-  return reply.code(200).type("text/plain").send("wechat callback online");
+
+  if (!signature || !echostr || !timestamp || !nonce) {
+    app.log.warn("[WeChat] GET missing required params");
+    return reply.code(400).type("text/plain").send("missing params");
+  }
+
+  // WeChat SA plain/compat mode: SHA1(sort([token, timestamp, nonce]).join(''))
+  const computed = sha1Hex([WECHAT_CONFIG.token, String(timestamp), String(nonce)].sort().join(""));
+  if (computed !== String(signature)) {
+    app.log.warn({ computed, received: signature }, "[WeChat] Signature verification FAILED");
+    return reply.code(403).type("text/plain").send("verification failed");
+  }
+
+  app.log.info({ echostr }, "[WeChat] Signature OK — returning echostr");
+  return reply.code(200).type("text/plain").send(String(echostr));
 });
 
 // POST /wechat/callback
