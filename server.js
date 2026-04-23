@@ -76,6 +76,11 @@ async function safeParseUpstream(res, reply, route) {
 // Health endpoint for Fly health checks
 app.get("/health", async () => ({ ok: true }));
 
+// WeChat domain verification file
+app.get("/7028d453-f412-4b4f-8bfd-e29dfe0a8033.txt", async (req, reply) => {
+  return reply.code(200).type("text/plain").send("HzyDCCt9VXZgF4Xh");
+});
+
 // Debug: confirm actual outbound egress IP
 app.get("/debug/egress-ip", async (req) => {
   requireAuth(req);
