@@ -5,7 +5,6 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 import { getWecomAccessToken, wecomSendText } from "./wecom.js";
 import { WECHAT_CONFIG, parseWeChatXml, summariseMessage, getWeChatAccessToken, sendWeChatCustomText, sendWeChatTemplateMessage } from "./wechat.js";
-import { persistWeChatEvent } from "./wechat-supabase.js";
 
 const app = Fastify({
   logger: true,
@@ -251,33 +250,34 @@ app.get("/wechat/callback", async (req, reply) => {
 // Parses inbound XML, logs a structured summary, persists to Supabase, returns success.
 app.post("/wechat/callback", async (req, reply) => {
   const rawXml = typeof req.body === "string" ? req.body : "";
-  app.log.info({
-    headers:     req.headers,
-    query:       req.query,
-    bodyLength:  rawXml.length,
-  }, "[WeChat] POST /wechat/callback - inbound event");
+  const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
 
+  // Structured log for observability
   const parseResult = parseWeChatXml(rawXml);
-  if (!parseResult.ok) {
-    app.log.error({ error: parseResult.error }, "[WeChat] XML parse failed — still returning success");
-    return reply.code(200).type("text/plain").send("success");
+  if (parseResult.ok) {
+    app.log.info(summariseMessage(parseResult.data, rawXml.length), "[WeChat] POST /wechat/callback - parsed message");
+  } else {
+    app.log.warn({ bodyLength: rawXml.length, error: parseResult.error }, "[WeChat] POST /wechat/callback - XML parse warn");
   }
 
-  const msg = parseResult.data;
-  const summary = summariseMessage(msg, rawXml.length);
-  app.log.info(summary, "[WeChat] parsed message summary");
+  // Forward to Supabase edge function
+  if (SUPABASE_FUNCTIONS_URL) {
+    const url = qs
+      ? `${SUPABASE_FUNCTIONS_URL}/wechat-sa-callback?${qs}`
+      : `${SUPABASE_FUNCTIONS_URL}/wechat-sa-callback`;
+    app.log.info(`[WeChat] Forwarding to ${url}`);
+    fetch(url, {
+      method: "POST",
+      headers: { "content-type": req.headers["content-type"] || "text/xml" },
+      body: rawXml,
+    })
+      .then((r) => app.log.info({ status: r.status }, "[WeChat] Supabase edge function response"))
+      .catch((err) => app.log.error({ err }, "[WeChat] Supabase forward failed — WeChat already got 200"));
+  } else {
+    app.log.warn("[WeChat] SUPABASE_FUNCTIONS_URL not set — skipping forward");
+  }
 
-  // Fire-and-forget persistence — never let a DB error break the 200 response
-  persistWeChatEvent({
-    fromUserName:  summary.FromUserName,
-    toUserName:    summary.ToUserName,
-    msgType:       summary.MsgType,
-    eventType:     summary.Event,
-    rawXml,
-    parsedPayload: msg,
-    log:           app.log,
-  }).catch((err) => app.log.error({ err }, "[WeChat] persistWeChatEvent uncaught error"));
-
+  // Always return success immediately; never block on Supabase
   return reply.code(200).type("text/plain").send("success");
 });
 
