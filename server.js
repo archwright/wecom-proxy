@@ -4,6 +4,8 @@ import Fastify from "fastify";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import { getWecomAccessToken, wecomSendText } from "./wecom.js";
+import { WECHAT_CONFIG, parseWeChatXml, summariseMessage, getWeChatAccessToken, sendWeChatCustomText, sendWeChatTemplateMessage } from "./wechat.js";
+import { persistWeChatEvent } from "./wechat-supabase.js";
 
 const app = Fastify({
   logger: true,
@@ -232,15 +234,50 @@ app.post("/wecom/callback", async (req, reply) => {
 // WeChat Service Account Webhook Routes
 // ============================================
 
-// GET /wechat/callback - URL verification by WeChat
+// GET /wechat/callback
+// Phase 1: return plain-text placeholder while WECHAT_TOKEN is not yet set.
+// Phase 2 (TODO): verify msg_signature + decrypt echostr once Token/AESKey are provided.
 app.get("/wechat/callback", async (req, reply) => {
-  app.log.info("[WeChat] GET /wechat/callback hit - URL verification");
+  app.log.info({ query: req.query }, "[WeChat] GET /wechat/callback - URL verification hit");
+  if (!WECHAT_CONFIG.token) {
+    app.log.warn("[WeChat] WECHAT_TOKEN not set — returning placeholder (verification not enforced)");
+    return reply.code(200).type("text/plain").send("wechat callback online");
+  }
+  // TODO: implement SHA1 signature check + AES echostr decrypt when token is configured
   return reply.code(200).type("text/plain").send("wechat callback online");
 });
 
-// POST /wechat/callback - Inbound WeChat messages/events
+// POST /wechat/callback
+// Parses inbound XML, logs a structured summary, persists to Supabase, returns success.
 app.post("/wechat/callback", async (req, reply) => {
-  app.log.info("[WeChat] POST /wechat/callback hit - inbound message received");
+  const rawXml = typeof req.body === "string" ? req.body : "";
+  app.log.info({
+    headers:     req.headers,
+    query:       req.query,
+    bodyLength:  rawXml.length,
+  }, "[WeChat] POST /wechat/callback - inbound event");
+
+  const parseResult = parseWeChatXml(rawXml);
+  if (!parseResult.ok) {
+    app.log.error({ error: parseResult.error }, "[WeChat] XML parse failed — still returning success");
+    return reply.code(200).type("text/plain").send("success");
+  }
+
+  const msg = parseResult.data;
+  const summary = summariseMessage(msg, rawXml.length);
+  app.log.info(summary, "[WeChat] parsed message summary");
+
+  // Fire-and-forget persistence — never let a DB error break the 200 response
+  persistWeChatEvent({
+    fromUserName:  summary.FromUserName,
+    toUserName:    summary.ToUserName,
+    msgType:       summary.MsgType,
+    eventType:     summary.Event,
+    rawXml,
+    parsedPayload: msg,
+    log:           app.log,
+  }).catch((err) => app.log.error({ err }, "[WeChat] persistWeChatEvent uncaught error"));
+
   return reply.code(200).type("text/plain").send("success");
 });
 
