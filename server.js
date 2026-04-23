@@ -616,6 +616,37 @@ app.post("/wecom/appchat/send", async (req, reply) => {
   }
 });
 
+// ============================================
+// WeChat Service Account — Outbound API Routes
+// ============================================
+
+// POST /wechat-sa/customer-message
+// Supabase -> Fly -> WeChat: send a custom (customer service) message
+// Body: { touser, msgtype, text: { content } }
+app.post("/wechat-sa/customer-message", async (req, reply) => {
+  requireAuth(req);
+  const { touser, msgtype, text } = req.body || {};
+  if (!touser) return reply.code(400).send({ errcode: -1, errmsg: "missing touser" });
+  if (!text?.content) return reply.code(400).send({ errcode: -1, errmsg: "missing text.content" });
+
+  const result = await sendWeChatCustomText({ openid: touser, content: text.content, log: app.log });
+  return reply.send(result);
+});
+
+// POST /wechat-sa/template-message
+// Supabase -> Fly -> WeChat: send a template message
+// Body: { touser, template_id, url?, miniprogram?, data }
+app.post("/wechat-sa/template-message", async (req, reply) => {
+  requireAuth(req);
+  const { touser, template_id, url, miniprogram, data } = req.body || {};
+  if (!touser)      return reply.code(400).send({ errcode: -1, errmsg: "missing touser" });
+  if (!template_id) return reply.code(400).send({ errcode: -1, errmsg: "missing template_id" });
+  if (!data)        return reply.code(400).send({ errcode: -1, errmsg: "missing data" });
+
+  const result = await sendWeChatTemplateMessage({ openid: touser, templateId: template_id, url, miniprogram, data, log: app.log });
+  return reply.send(result);
+});
+
 const port = process.env.PORT ? Number(process.env.PORT) : 8080;
 
 try {
