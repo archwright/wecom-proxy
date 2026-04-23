@@ -140,9 +140,13 @@ function decryptWecomEchoStr({ encodingAESKey, corpId, echostrB64 }) {
   // Base64 decode echostr
   const cipherBuf = Buffer.from(echostrB64, "base64");
 
-  // AES-256-CBC decrypt (PKCS7 padding handled by Node)
+  // AES-256-CBC decrypt — WeChat uses 32-byte PKCS7 block, not standard 16-byte
+  // setAutoPadding(false) + manual strip handles both cases cleanly
   const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
-  const plain = Buffer.concat([decipher.update(cipherBuf), decipher.final()]);
+  decipher.setAutoPadding(false);
+  const raw = Buffer.concat([decipher.update(cipherBuf), decipher.final()]);
+  const padLen = raw[raw.length - 1];
+  const plain = raw.subarray(0, raw.length - padLen);
 
   // Plain structure: random(16) + msg_len(4) + msg + corpId
   const msgLen = plain.readUInt32BE(16);
