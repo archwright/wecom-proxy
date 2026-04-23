@@ -260,29 +260,66 @@ app.get("/wechat/callback", async (req, reply) => {
 });
 
 // POST /wechat/callback
-// Parses inbound XML, logs a structured summary, persists to Supabase, returns success.
+// AES Safe Mode decrypt → forward plaintext XML to Supabase wechat-sa-callback
 app.post("/wechat/callback", async (req, reply) => {
   const rawXml = typeof req.body === "string" ? req.body : "";
   const qs = req.url.includes("?") ? req.url.split("?")[1] : "";
+  const { encrypt_type, msg_signature, timestamp, nonce } = req.query || {};
 
-  // Structured log for observability
-  const parseResult = parseWeChatXml(rawXml);
-  if (parseResult.ok) {
-    app.log.info(summariseMessage(parseResult.data, rawXml.length), "[WeChat] POST /wechat/callback - parsed message");
-  } else {
-    app.log.warn({ bodyLength: rawXml.length, error: parseResult.error }, "[WeChat] POST /wechat/callback - XML parse warn");
+  let forwardBody = rawXml;
+
+  if (encrypt_type === "aes") {
+    // 1. Parse the encrypted envelope to extract <Encrypt> content
+    const envelope = parseWeChatXml(rawXml);
+    if (!envelope.ok) {
+      app.log.error({ error: envelope.error }, "[WeChat] POST - failed to parse encrypted envelope");
+      return reply.code(200).type("text/plain").send("success");
+    }
+    const encryptContent = String(envelope.data?.Encrypt || "");
+    if (!encryptContent) {
+      app.log.error("[WeChat] POST - no <Encrypt> field found");
+      return reply.code(200).type("text/plain").send("success");
+    }
+
+    // 2. Verify msg_signature: SHA1(sort([token, timestamp, nonce, encryptContent]))
+    const computedSig = sha1Hex([WECHAT_CONFIG.token, String(timestamp), String(nonce), encryptContent].sort().join(""));
+    if (computedSig !== String(msg_signature)) {
+      app.log.warn({ computed: computedSig, received: msg_signature }, "[WeChat] POST msg_signature mismatch — dropping");
+      return reply.code(200).type("text/plain").send("success");
+    }
+
+    // 3. AES-256-CBC decrypt (reuses existing decryptWecomEchoStr — same Tencent layout)
+    try {
+      forwardBody = decryptWecomEchoStr({
+        encodingAESKey: WECHAT_CONFIG.encodingAESKey,
+        corpId: WECHAT_CONFIG.appId,
+        echostrB64: encryptContent,
+      });
+      app.log.info({ decryptedLength: forwardBody.length }, "[WeChat] POST - AES decrypt OK");
+    } catch (err) {
+      app.log.error({ err }, "[WeChat] POST - AES decrypt failed — dropping");
+      return reply.code(200).type("text/plain").send("success");
+    }
   }
 
-  // Forward to Supabase edge function
+  // 4. Log structured summary of the decrypted message
+  const parsed = parseWeChatXml(forwardBody);
+  if (parsed.ok) {
+    app.log.info(summariseMessage(parsed.data, forwardBody.length), "[WeChat] POST - decrypted message summary");
+  } else {
+    app.log.warn({ bodyLength: forwardBody.length }, "[WeChat] POST - could not parse decrypted body");
+  }
+
+  // 5. Forward decrypted plain XML to Supabase
   if (SUPABASE_FUNCTIONS_URL) {
     const url = qs
       ? `${SUPABASE_FUNCTIONS_URL}/wechat-sa-callback?${qs}`
       : `${SUPABASE_FUNCTIONS_URL}/wechat-sa-callback`;
-    app.log.info(`[WeChat] Forwarding to ${url}`);
+    app.log.info(`[WeChat] Forwarding decrypted XML to ${url}`);
     fetch(url, {
       method: "POST",
-      headers: { "content-type": req.headers["content-type"] || "text/xml", "authorization": `Bearer ${PROXY_SHARED_SECRET}` },
-      body: rawXml,
+      headers: { "content-type": "text/xml", "authorization": `Bearer ${PROXY_SHARED_SECRET}` },
+      body: forwardBody,
     })
       .then((r) => app.log.info({ status: r.status }, "[WeChat] Supabase edge function response"))
       .catch((err) => app.log.error({ err }, "[WeChat] Supabase forward failed — WeChat already got 200"));
@@ -290,7 +327,6 @@ app.post("/wechat/callback", async (req, reply) => {
     app.log.warn("[WeChat] SUPABASE_FUNCTIONS_URL not set — skipping forward");
   }
 
-  // Always return success immediately; never block on Supabase
   return reply.code(200).type("text/plain").send("success");
 });
 
