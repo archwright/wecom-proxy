@@ -17,6 +17,9 @@ app.addContentTypeParser("text/xml", { parseAs: "string" }, (req, body, done) =>
 app.addContentTypeParser("application/xml", { parseAs: "string" }, (req, body, done) => {
   done(null, body);
 });
+app.addContentTypeParser("text/plain", { parseAs: "string" }, (req, body, done) => {
+  done(null, body);
+});
 
 const {
   PROXY_SHARED_SECRET,
@@ -218,6 +221,22 @@ app.post("/wecom/callback", async (req, reply) => {
   app.log.info(`[POST] Supabase response: ${res.status} - ${text}`);
 
   reply.code(res.status).send(text);
+});
+
+// ============================================
+// WeChat Service Account Webhook Routes
+// ============================================
+
+// GET /wechat/callback - URL verification by WeChat
+app.get("/wechat/callback", async (req, reply) => {
+  app.log.info("[WeChat] GET /wechat/callback hit - URL verification");
+  return reply.code(200).type("text/plain").send("wechat callback online");
+});
+
+// POST /wechat/callback - Inbound WeChat messages/events
+app.post("/wechat/callback", async (req, reply) => {
+  app.log.info("[WeChat] POST /wechat/callback hit - inbound message received");
+  return reply.code(200).type("text/plain").send("success");
 });
 
 // ============================================
