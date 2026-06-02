@@ -22,6 +22,13 @@ app.addContentTypeParser("application/xml", { parseAs: "string" }, (req, body, d
 app.addContentTypeParser("text/plain", { parseAs: "string" }, (req, body, done) => {
   done(null, body);
 });
+// Raw buffer pass-through for BlueEdu relay (multipart streams, urlencoded)
+app.addContentTypeParser("multipart/form-data", { parseAs: "buffer" }, (req, body, done) => {
+  done(null, body);
+});
+app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "buffer" }, (req, body, done) => {
+  done(null, body);
+});
 
 const {
   PROXY_SHARED_SECRET,
@@ -44,6 +51,10 @@ const {
   BLUEEDU_API_KEY,      // optional: added as X-Api-Key header to BlueEdu requests
   SUPABASE_URL,         // e.g. https://xxxx.supabase.co
   SUPABASE_SERVICE_ROLE_KEY,  // injected as apikey + Authorization on Supabase requests
+
+  // BlueEdu Supabase relay
+  BLUEEDU_UPSTREAM_URL,   // e.g. https://control.blueeducation.org/BlueEdu_api
+  RELAY_SHARED_SECRET,    // X-Relay-Key header value required on all /proxy/* requests
 } = process.env;
 
 // Initialise IP whitelist (null = disabled)
@@ -817,6 +828,83 @@ for (const method of PROXY_METHODS) {
     return proxyRequest({ req, reply, targetBase: SUPABASE_URL, extraHeaders });
   });
 }
+
+// ============================================
+// BlueEdu API relay — ALL /proxy/*
+// Supabase edge functions call this; it forwards to control.blueeducation.org
+// from a static dedicated IPv4 that BlueEdu whitelists.
+// Auth: X-Relay-Key header must match RELAY_SHARED_SECRET.
+// ============================================
+
+app.get("/healthz", async () => "ok");
+
+const RELAY_DROP_HEADERS = new Set(["host", "content-length", "connection", "accept-encoding"]);
+
+app.all("/proxy/*", async (req, reply) => {
+  const start = Date.now();
+  const requestId = req.headers["x-request-id"] || crypto.randomUUID();
+
+  if (!RELAY_SHARED_SECRET || req.headers["x-relay-key"] !== RELAY_SHARED_SECRET) {
+    return reply.code(401).send({ code: -1, msg: "Unauthorized" });
+  }
+
+  if (!BLUEEDU_UPSTREAM_URL) {
+    return reply.code(500).send({ code: -1, msg: "BLUEEDU_UPSTREAM_URL not configured" });
+  }
+
+  const suffix = req.params["*"] ?? "";
+  const queryStart = req.url.indexOf("?");
+  const query = queryStart !== -1 ? req.url.slice(queryStart) : "";
+  const base = BLUEEDU_UPSTREAM_URL.replace(/\/$/, "");
+  const upstreamUrl = `${base}/${suffix}${query}`;
+  const upstreamHost = new URL(BLUEEDU_UPSTREAM_URL).host;
+
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (!RELAY_DROP_HEADERS.has(k.toLowerCase())) headers[k] = v;
+  }
+  headers["host"] = upstreamHost;
+
+  let body;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    if (Buffer.isBuffer(req.body)) body = req.body;
+    else if (typeof req.body === "object" && req.body !== null) body = JSON.stringify(req.body);
+    else if (typeof req.body === "string") body = req.body;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25000);
+
+  let res;
+  try {
+    res = await globalThis.fetch(upstreamUrl, {
+      method: req.method,
+      headers,
+      body,
+      signal: controller.signal,
+      duplex: "half",
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    const duration = Date.now() - start;
+    const isTimeout = err.name === "AbortError";
+    app.log.info({ method: req.method, path: req.url, status: isTimeout ? 504 : 502, duration, requestId }, "[blueedu-relay]");
+    return isTimeout
+      ? reply.code(504).send({ code: -1, msg: "Upstream timeout" })
+      : reply.code(502).send({ code: -1, msg: err.message });
+  }
+
+  clearTimeout(timer);
+  app.log.info({ method: req.method, path: req.url, status: res.status, duration: Date.now() - start, requestId }, "[blueedu-relay]");
+
+  reply.code(res.status);
+  for (const [k, v] of res.headers) {
+    if (k !== "connection" && k !== "transfer-encoding") reply.header(k, v);
+  }
+
+  const { Readable } = await import("node:stream");
+  return reply.send(Readable.fromWeb(res.body));
+});
 
 // ============================================
 // Admin: IP whitelist status (protected)
