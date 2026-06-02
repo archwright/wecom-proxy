@@ -5,6 +5,7 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 import { getWecomAccessToken, wecomSendText } from "./wecom.js";
 import { WECHAT_CONFIG, parseWeChatXml, summariseMessage, getWeChatAccessToken, sendWeChatCustomText, sendWeChatTemplateMessage } from "./wechat.js";
+import { parseAllowedIPs, isAllowed, isExemptPath, getClientIP } from "./ip-whitelist.js";
 
 const app = Fastify({
   logger: true,
@@ -33,8 +34,38 @@ const {
 
   // Used ONLY for WeCom KF URL verification (GET /wecom/kf-callback)
   WECOM_KF_TOKEN,
-  WECOM_KF_ENCODING_AES_KEY
+  WECOM_KF_ENCODING_AES_KEY,
+
+  // IP whitelist — comma-separated IPs/CIDR blocks; empty = disabled
+  ALLOWED_IPS,
+
+  // Central API proxy targets
+  BLUEEDU_API_URL,      // e.g. https://api.blueedu.example.com
+  BLUEEDU_API_KEY,      // optional: added as X-Api-Key header to BlueEdu requests
+  SUPABASE_URL,         // e.g. https://xxxx.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY,  // injected as apikey + Authorization on Supabase requests
 } = process.env;
+
+// Initialise IP whitelist (null = disabled)
+const allowedIPs = parseAllowedIPs(ALLOWED_IPS);
+if (allowedIPs) {
+  app.log.info({ allowedIPs }, "[IP Whitelist] Enabled");
+} else {
+  app.log.warn("[IP Whitelist] ALLOWED_IPS not set — whitelist DISABLED");
+}
+
+// ============================================
+// IP Whitelist — runs on every request
+// Exempt paths (webhook callbacks) always pass through.
+// ============================================
+app.addHook("onRequest", async (req, reply) => {
+  if (isExemptPath(req.url)) return; // let webhook callbacks through
+  const clientIP = getClientIP(req);
+  if (!isAllowed(clientIP, allowedIPs)) {
+    req.log.warn({ clientIP, url: req.url }, "[IP Whitelist] Blocked request");
+    return reply.code(403).send({ error: "Forbidden", ip: clientIP });
+  }
+});
 
 function requireAuth(req) {
   const auth = req.headers["authorization"] || "";
@@ -83,10 +114,10 @@ app.get("/7028d453-f412-4b4f-8bfd-e29dfe0a8033.txt", async (req, reply) => {
 });
 
 // Debug: confirm actual outbound egress IP
-app.get("/debug/egress-ip", async (req) => {
+app.get("/debug/egress-ip", async (req, reply) => {
   requireAuth(req);
   const res = await fetch("https://api.ipify.org?format=json");
-  const data = await safeParseUpstream(res, reply, 'kf-sync');
+  const data = await safeParseUpstream(res, reply, 'egress-ip');
   if (data === null) return;
   return reply.send(data);
 });
@@ -685,6 +716,120 @@ app.post("/wechat-sa/template-message", async (req, reply) => {
 
   const result = await sendWeChatTemplateMessage({ openid: touser, templateId: template_id, url, miniprogram, data, log: app.log });
   return reply.send(result);
+});
+
+// ============================================
+// Central API Proxy
+// Routes:
+//   /api/blueedu/*  → BLUEEDU_API_URL  (adds BLUEEDU_API_KEY if set)
+//   /api/supabase/* → SUPABASE_URL     (injects service-role key)
+//
+// All routes require Bearer token auth + IP whitelist (via global hook above).
+// ============================================
+
+// Headers that must not be forwarded to/from upstream
+const HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "transfer-encoding", "te", "trailer",
+  "upgrade", "proxy-authorization", "proxy-authenticate",
+  // Fly-specific internal headers — don't leak to upstreams
+  "fly-client-ip", "fly-forwarded-port", "fly-region", "fly-request-id",
+]);
+
+async function proxyRequest({ req, reply, targetBase, extraHeaders = {} }) {
+  requireAuth(req);
+
+  if (!targetBase) {
+    return reply.code(503).send({ error: "Proxy target not configured" });
+  }
+
+  // Build target URL: strip the /api/xxx prefix and keep the rest + query
+  const wildcardPath = req.params["*"] || "";
+  const qs = req.url.includes("?") ? req.url.split("?").slice(1).join("?") : "";
+  const targetURL = `${targetBase.replace(/\/$/, "")}/${wildcardPath}${qs ? `?${qs}` : ""}`;
+
+  // Forward headers (drop hop-by-hop and Fly internals)
+  const forwardHeaders = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (!HOP_BY_HOP.has(key.toLowerCase()) && key.toLowerCase() !== "host") {
+      forwardHeaders[key] = value;
+    }
+  }
+  // Inject extra headers (auth keys, etc.)
+  Object.assign(forwardHeaders, extraHeaders);
+
+  // Serialize body
+  let body;
+  const method = req.method.toUpperCase();
+  if (method !== "GET" && method !== "HEAD" && req.body !== undefined && req.body !== null) {
+    if (typeof req.body === "string") {
+      body = req.body;
+    } else if (Buffer.isBuffer(req.body)) {
+      body = req.body;
+    } else {
+      body = JSON.stringify(req.body);
+      forwardHeaders["content-type"] = forwardHeaders["content-type"] || "application/json";
+    }
+  }
+
+  req.log.info({ method, targetURL }, "[proxy] Forwarding request");
+
+  let res;
+  try {
+    res = await fetch(targetURL, { method, headers: forwardHeaders, body });
+  } catch (err) {
+    req.log.error({ err, targetURL }, "[proxy] Upstream fetch failed");
+    return reply.code(502).send({ error: "Upstream unreachable", detail: err.message });
+  }
+
+  // Forward response headers (drop hop-by-hop)
+  for (const [key, value] of res.headers.entries()) {
+    if (!HOP_BY_HOP.has(key.toLowerCase())) {
+      reply.header(key, value);
+    }
+  }
+
+  const responseBuffer = Buffer.from(await res.arrayBuffer());
+  req.log.info({ status: res.status, bytes: responseBuffer.length }, "[proxy] Upstream response");
+  return reply.code(res.status).send(responseBuffer);
+}
+
+// Register proxy routes for all relevant HTTP methods
+const PROXY_METHODS = ["get", "post", "put", "patch", "delete"];
+
+// /api/blueedu/* → BlueEdu Java backend
+for (const method of PROXY_METHODS) {
+  app[method]("/api/blueedu/*", async (req, reply) => {
+    const extraHeaders = {};
+    if (BLUEEDU_API_KEY) extraHeaders["x-api-key"] = BLUEEDU_API_KEY;
+    return proxyRequest({ req, reply, targetBase: BLUEEDU_API_URL, extraHeaders });
+  });
+}
+
+// /api/supabase/* → Supabase (REST, Edge Functions, or Storage)
+// The service-role key is injected here so callers only need PROXY_SHARED_SECRET.
+for (const method of PROXY_METHODS) {
+  app[method]("/api/supabase/*", async (req, reply) => {
+    const extraHeaders = {};
+    if (SUPABASE_SERVICE_ROLE_KEY) {
+      extraHeaders["apikey"] = SUPABASE_SERVICE_ROLE_KEY;
+      extraHeaders["authorization"] = `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`;
+    }
+    return proxyRequest({ req, reply, targetBase: SUPABASE_URL, extraHeaders });
+  });
+}
+
+// ============================================
+// Admin: IP whitelist status (protected)
+// ============================================
+app.get("/admin/ip-whitelist", async (req, reply) => {
+  requireAuth(req);
+  const clientIP = getClientIP(req);
+  return {
+    enabled: allowedIPs !== null,
+    allowed_ips: allowedIPs ?? [],
+    your_ip: clientIP,
+    your_ip_allowed: isAllowed(clientIP, allowedIPs),
+  };
 });
 
 const port = process.env.PORT ? Number(process.env.PORT) : 8080;
